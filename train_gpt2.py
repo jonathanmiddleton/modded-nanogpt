@@ -11,9 +11,9 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
-import torch.distributed as dist
+# import torch.distributed as dist
 import torch._inductor.config as config
-from torch.nn.parallel import DistributedDataParallel as DDP
+# from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @bkoszarsky
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 flex_attention = torch.compile(flex_attention, dynamic=False)
@@ -92,35 +92,51 @@ class Muon(torch.optim.Optimizer):
             zeropower_backend = zeropower_backends[group['backend']]
 
             # generate weight updates in distributed fashion
-            total_params = sum(p.numel() for p in group['params'])
-            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
-            curr_idx = 0
-            for i, p in enumerate(group['params']):
-                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
-                if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
-                    g = p.grad
-                    assert g is not None
-                    state = self.state[p]
-                    if 'momentum_buffer' not in state:
-                        state['momentum_buffer'] = torch.zeros_like(g)
-                    buf = state['momentum_buffer']
-                    buf.mul_(momentum).add_(g)
-                    if group['nesterov']:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_backend(g, steps=group['backend_steps'])
-                    g *= max(1, g.size(0)/g.size(1))**0.5
-                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
-                curr_idx += p.numel()
+            # total_params = sum(p.numel() for p in group['params'])
+            # updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
+            # curr_idx = 0
+            # for i, p in enumerate(group['params']):
+            #     # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
+            #     if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
+            #         g = p.grad
+            #         assert g is not None
+            #         state = self.state[p]
+            #         if 'momentum_buffer' not in state:
+            #             state['momentum_buffer'] = torch.zeros_like(g)
+            #         buf = state['momentum_buffer']
+            #         buf.mul_(momentum).add_(g)
+            #         if group['nesterov']:
+            #             g = g.add(buf, alpha=momentum)
+            #         g = zeropower_backend(g, steps=group['backend_steps'])
+            #         g *= max(1, g.size(0)/g.size(1))**0.5
+            #         updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
+            #     curr_idx += p.numel()
 
             # sync updates across devices. we are not memory-constrained so can do this simple deserialization
-            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
-
+            # dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
             # deserialize and apply updates
-            curr_idx = 0
+            # curr_idx = 0
+            # for p in group['params']:
+            #     g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
+            #     p.data.add_(g, alpha=-lr)
+            #     curr_idx += p.numel()
+
+            # single-device updates; no distributed flatten/reduce
             for p in group['params']:
-                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
+                g = p.grad
+                assert g is not None
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+                buf = state['momentum_buffer']
+                buf.mul_(momentum).add_(g)
+                if group['nesterov']:
+                    g = g.add(buf, alpha=momentum)
+                g = zeropower_backend(g, steps=group['backend_steps'])
+                g *= max(1, g.size(0)/g.size(1))**0.5
                 p.data.add_(g, alpha=-lr)
-                curr_idx += p.numel()
+
+
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -382,7 +398,7 @@ args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
-dist.init_process_group(backend='nccl')
+# dist.init_process_group(backend='nccl')
 ddp_rank = int(os.environ['RANK'])
 ddp_local_rank = int(os.environ['LOCAL_RANK'])
 ddp_world_size = int(os.environ['WORLD_SIZE'])
@@ -447,8 +463,8 @@ if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
 # here we wrap model into DDP container
-model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module # always contains the "raw" unwrapped model
+# model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model #model.module # always contains the "raw" unwrapped model
 
 # CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
 from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
@@ -510,7 +526,7 @@ for step in range(args.num_iterations + 1):
             with torch.no_grad():
                 x_val, y_val = val_loader.next_batch()
                 val_loss += model(x_val, y_val)
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        # dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
         print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
@@ -545,11 +561,12 @@ for step in range(args.num_iterations + 1):
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
         # backward pass
-        if i < train_accumulation_steps:
-            with model.no_sync(): # there's no need to sync gradients every accumulation step
-                loss.backward()
-        else:
-            loss.backward() # just sync on the last step
+        loss.backward()
+        # if i < train_accumulation_steps:
+        #     with model.no_sync(): # there's no need to sync gradients every accumulation step
+        #         loss.backward()
+        # else:
+        #     loss.backward() # just sync on the last step
     for p in model.parameters():
         p.grad /= train_accumulation_steps
     # momentum warmup for Muon
@@ -573,4 +590,4 @@ if master_process:
 
 # -------------------------------------------------------------------------
 # clean up nice
-dist.destroy_process_group()
+# dist.destroy_process_group()
