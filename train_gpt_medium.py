@@ -1,5 +1,6 @@
 import os
 import sys
+
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
@@ -11,6 +12,9 @@ from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
+torch._dynamo.config.error_on_nested_fx_trace = False # temp workaround/diagnostic for dynamo error
+from torch._dynamo import disable
+
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -170,7 +174,13 @@ class CausalSelfAttention(nn.Module):
             v = lambdas[0] * v + lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
             v = lambdas[0] * v
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
+        y = _flex_call(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            block_mask,
+            self.attn_scale,
+        ).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, self.qkvo_w[3])
         return y
@@ -229,6 +239,7 @@ class GPT(nn.Module):
             *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)], # SA lambdas
         ]))
 
+    #@disable
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
         docs = (input_seq == 50256).cumsum(0)
@@ -346,8 +357,8 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
 @dataclass
 class Hyperparameters:
     # data
-    train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
-    val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
+    train_files = "data/fineweb100B/fineweb_train_*.bin" # input .bin to train on
+    val_files = "data/fineweb100B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     train_seq_len = 64*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
@@ -358,7 +369,7 @@ class Hyperparameters:
     vocab_size = 50257
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
-    save_checkpoint = False
+    save_checkpoint = True
 args = Hyperparameters()
 
 run_id = int(os.environ.get("RUN_ID", 0))
@@ -388,10 +399,21 @@ def print0(s, console=False):
 from torch._logging._internal import trace_structured # noqa: E402
 import torch._inductor.codecache # noqa: E402
 import torch._inductor.graph # noqa: E402
-def _patched_trace_structured(name, metadata_fn, **kwargs):
-    if name == "inductor_output_code":
-        print0(f"inductor_output_code: {metadata_fn().get("filename", "Unknown")}")
-    trace_structured(name, metadata_fn, **kwargs)
+from torch._logging._internal import trace_structured as _orig_trace_structured # noqa: E402
+
+def _patched_trace_structured(*args, **kwargs):
+    name = args[0] if args else kwargs.get("name")
+    md_fn = None
+    if len(args) >= 2 and callable(args[1]): md_fn = args[1]
+    if md_fn is None: md_fn = kwargs.get("metadata_fn")
+    if name == "inductor_output_code" and callable(md_fn):
+        try:
+            info = md_fn() or {}
+            print0(f"inductor_output_code: {info.get('filename', 'Unknown')}")
+        except Exception:
+            pass
+    return _orig_trace_structured(*args, **kwargs)
+
 torch._inductor.codecache.trace_structured = _patched_trace_structured
 torch._inductor.graph.trace_structured = _patched_trace_structured
 
@@ -410,6 +432,10 @@ print0("="*100)
 ########################################
 #    Construct model and optimizer     #
 ########################################
+
+#@disable
+def _flex_call(q, k, v, block_mask, scale):
+    return flex_attention(q, k, v, block_mask=block_mask, scale=scale)
 
 model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, num_heads=8, model_dim=1024,
                        max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
