@@ -552,6 +552,16 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
 # -----------------------------------------------------------------------------
 # int main
 
+# torchrun sets these env variables
+rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+assert torch.cuda.is_available()
+device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+torch.cuda.set_device(device)
+dist.init_process_group(backend="nccl", device_id=device)
+dist.barrier()
+master_process = (rank == 0) # this process will do logging, checkpointing etc.
+
 @dataclass
 class Hyperparameters:
     # data
@@ -561,23 +571,13 @@ class Hyperparameters:
     train_seq_len = 48*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 1750 # number of iterations to run
+    # number of iterations to run, scaled by effective global batch size with world_size=8, num_iterations=1750 as a basis
+    num_iterations = int(1750 * 8 // world_size)
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
 args = Hyperparameters()
-
-# torchrun sets these env variables
-rank = int(os.environ["RANK"])
-world_size = int(os.environ["WORLD_SIZE"])
-#assert world_size == 8 # this code is designed for 8xH100
-assert torch.cuda.is_available()
-device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
-dist.barrier()
-master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
 # begin logging
 logfile = None
@@ -657,20 +657,20 @@ model: nn.Module = torch.compile(model, dynamic=False)
 ########################################
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
-warmup_steps = 10
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
-for _ in range(warmup_steps):
-    inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(1)).backward()
-    for opt in optimizers:
-        opt.step()
-    model.zero_grad(set_to_none=True)
-model.load_state_dict(initial_state["model"])
-for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
-    opt.load_state_dict(opt_state)
-del train_loader, initial_state
+# warmup_steps = 10
+# initial_state = dict(model=copy.deepcopy(model.state_dict()),
+#                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
+# train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+# for _ in range(warmup_steps):
+#     inputs, targets = next(train_loader)
+#     model(inputs, targets, get_window_size_blocks(1)).backward()
+#     for opt in optimizers:
+#         opt.step()
+#     model.zero_grad(set_to_none=True)
+# model.load_state_dict(initial_state["model"])
+# for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
+#     opt.load_state_dict(opt_state)
+# del train_loader, initial_state
 
 ########################################
 #        Training and validation       #
