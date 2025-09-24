@@ -533,7 +533,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
     local_batch_size = batch_size // world_size
     file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
     tokens, pos = _load_data_shard(next(file_iter)), 0
-    max_batch_span = 2 * batch_size if align_to_bos else batch_size # provide buffer to handle samples up to length local_batch_size
+    max_batch_span = int(args.max_batch_span_factor * 2 * batch_size) if align_to_bos else batch_size # provide buffer to handle samples up to length local_batch_size
     while True:
         if pos + max_batch_span + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
@@ -568,15 +568,17 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     world_size_factor = 8 / world_size
+    scaling_factor = 3 # dial up for mem utilization
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 2*48*1024 # FlexAttention sequence length
+    train_seq_len = scaling_factor*48*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
+    max_batch_span_factor = 1.25 # dial for locating batch starts, default = 1
     # optimization
     # number of iterations to run, scaled by effective global batch size with world_size=8, num_iterations=1750 as a basis
-    num_iterations = int(1750 * world_size_factor)
+    num_iterations = int(1750 * world_size_factor/scaling_factor)
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
     # evaluation and logging
-    val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every = 250 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
 args = Hyperparameters()
 
