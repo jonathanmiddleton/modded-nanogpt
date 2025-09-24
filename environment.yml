@@ -1,0 +1,12 @@
+name: modded
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - git
+  - numpy
+  - tqdm
+  - huggingface_hub[cli]
+  # torch will be installed via pip in the activation hook to allow the nightly/cu build
