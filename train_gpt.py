@@ -572,7 +572,7 @@ class Hyperparameters:
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     train_seq_len = scaling_factor*48*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
-    max_batch_span_factor = 1.25 # dial for locating batch starts, default = 1
+    max_batch_span_factor = 1.1 # dial for locating batch starts, default = 1
     # optimization
     # number of iterations to run, scaled by effective global batch size with world_size=8, num_iterations=1750 as a basis
     num_iterations = int(1750 * world_size_factor/scaling_factor)
