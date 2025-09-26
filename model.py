@@ -142,6 +142,19 @@ class Block(nn.Module):
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
+
+def apply_rep_penalty_decay(logits, prev_ids, rep_p, W=128, half_life=140.0, cap=3.0):
+    prev = prev_ids[-W:]
+    if prev.numel() == 0:
+        return logits
+    V = logits.size(-1)
+    d = torch.arange(prev.numel(), 0, -1, device=logits.device, dtype=logits.dtype)
+    w = (0.5 ** (d / half_life))
+    s = torch.bincount(prev, weights=w, minlength=V).to(logits.dtype).clamp_max_(cap)
+    scale = rep_p ** s
+    return torch.where(logits > 0, logits / scale, logits * scale)
+
+
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
         super().__init__()
@@ -280,9 +293,8 @@ class GPT(nn.Module):
 
         return logits.view(x.size(0), x.size(1), -1)
 
-
     @torch.inference_mode()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, repetition_penalty=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (B,T)) B=1 and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -296,6 +308,8 @@ class GPT(nn.Module):
         device = idx.device
 
         sliding_window_num_blocks = torch.empty((), dtype=torch.int32, device=device)
+        prev_ids = torch.empty(0, dtype=torch.int32, device=device)
+        W = 192 # repetition window size
         for _ in range(max_new_tokens):
             # format for block masking
             idx_padded, _ = _pad_mod_block_size(_crop_to_max_seq_len(idx, args.block_size), args.block_size)
@@ -307,12 +321,19 @@ class GPT(nn.Module):
             t_last = idx.size(1)-1
             logits = logits[:, t_last, :args.vocab_size] / temperature
 
+            logits = apply_rep_penalty_decay(logits, prev_ids, rep_p=repetition_penalty, W=W)
+
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
 
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
+
             idx = torch.cat((idx, idx_next), dim=1)
+            if idx_next.item() == 50256:
+                break
+
+            prev_ids = torch.cat((prev_ids, idx_next.squeeze(0)), dim=0)
 
         return idx

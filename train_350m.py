@@ -539,9 +539,9 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(3456 * factor, n=128)
     return get_window_size_blocks_helper(window_size)
 
-print("Compiling model. This may take a while... ", end="", flush=True)
+print("Compiling model...", end="", flush=True)
 model: nn.Module = torch.compile(model, dynamic=False)
-print("...done.", flush=True)
+print("done.", flush=True)
 
 ########################################
 #        Training and validation       #
