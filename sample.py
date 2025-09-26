@@ -4,7 +4,6 @@ import torch
 from torch import nn, load, tensor
 import tiktoken
 from model import GPT, Hyperparameters as args
-from contextlib import nullcontext
 
 # Command line interface
 parser = argparse.ArgumentParser(description="Generate text with a GPT model from a checkpoint.")
@@ -19,7 +18,6 @@ parser.add_argument(
     help="Device to run on: e.g., 'cpu', 'cuda', 'cuda:0', or 'mps'"
 )
 
-# Print a simple usage if no arguments are provided
 if len(sys.argv) == 1:
     parser.print_usage()
     print("\nExample: python sample.py /path/to/checkpoint.pt --device cuda --max_tokens 50 --temperature 0.3 --top_k 50")
@@ -50,7 +48,6 @@ decode = lambda l: enc.decode(l)
 start_ids = encode("Q: The most popular movie of all time is Avatar. What is your favorite movie?\nA:")
 x = tensor(start_ids, dtype=torch.long, device=device)[None, ...]
 
-# Normalize device type for autocast
 devtype = "cuda" if str(device).startswith("cuda") else ("mps" if str(device).startswith("mps") else "cpu")
 ctx = torch.amp.autocast(device_type=devtype, dtype=torch.bfloat16)
 with torch.no_grad():
