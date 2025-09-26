@@ -1,4 +1,4 @@
-name: modded
+name: daisy-wee
 channels:
   - conda-forge
   - defaults
@@ -9,4 +9,3 @@ dependencies:
   - numpy
   - tqdm
   - huggingface_hub[cli]
-  # torch will be installed via pip in the activation hook to allow the nightly/cu build
