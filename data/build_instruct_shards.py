@@ -38,7 +38,7 @@ def _pairs_dolly15k():
         if y: yield y
 
 def _pairs_openhermes():
-    ds = load_dataset("HuggingFaceTB/OpenHermes-2.5-H4", split="train")
+    ds = load_dataset("HuggingFaceTB/OpenHermes-2.5-H4", split="train_sft")
     for r in ds:
         msgs = r.get("messages") or r.get("conversations")
         if not msgs: continue
