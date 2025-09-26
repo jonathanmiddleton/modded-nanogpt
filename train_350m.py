@@ -413,7 +413,8 @@ run_id = int(os.environ.get("RUN_ID", 0))
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert world_size == 8 # this code is designed for 8xH100
+if world_size != 8:
+    print("[warn] This script is designed to run with world_size=8.")
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
