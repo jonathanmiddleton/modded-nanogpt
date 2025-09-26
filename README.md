@@ -1,8 +1,15 @@
 # Daisy-Wee - Efficient GPT for Small‑B Models
 
-![Daisy‑Wee](assets/daisywee.png)
-
-Daisy-Wee is a fork of the excellent [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt.git), itself a fork of the venerable [nanoGPT](https://github.com/karpathy/nanoGPT.git).
+<table>
+  <tr>
+    <td>
+      <img src="assets/daisy-wee.png" alt="Daisy‑Wee" width="160">
+    </td>
+    <td>
+      Daisy-Wee is a fork of the excellent <a href="https://github.com/KellerJordan/modded-nanogpt.git">modded-nanogpt</a>, itself a fork of the venerable <a href="https://github.com/karpathy/nanoGPT.git">nanoGPT</a>.
+    </td>
+  </tr>
+</table>
 
 > **Note:** This is an exploratory project. Goals are to probe, measure, and share what works—not to ship a production system. Interfaces and results will evolve.
 
@@ -10,7 +17,7 @@ Daisy-Wee is a fork of the excellent [modded-nanogpt](https://github.com/KellerJ
 
 ## Mission & Vision
 
-**Mission.** Contribute to practical methods for small‑B GPTs on commodity multi‑GPU hardware by exploring measurable efficiency, stable training, and long‑context instruction‑following—using sliding‑window/block‑sparse attention, RoPE, fused QKV(+O), BF16‑first training, and pragmatic optimizer design; a lightweight MoE path extends the same scaffold.
+**Mission.** Contribute to practical methods for training small‑B GPTs on commodity multi‑GPU hardware by exploring measurable efficiency, stable training, and long‑context instruction‑following—using sliding‑window/block‑sparse attention, RoPE, fused QKV(+O), BF16‑first training, and pragmatic optimizer design; a lightweight MoE path extends the same scaffold.
 
 **Vision.** Reliable, reproducible small models that practitioners can train and serve without large budgets, incrementally scaling from a 350M‑class baseline toward 1.5B+ while preserving throughput and memory efficiency. The emphasis is on openness, careful measurement, and simple designs that others can adapt.
 
@@ -136,22 +143,11 @@ MoE will be introduced incrementally and benchmarked against the dense baseline 
 
 ---
 
-## Scaling to 1.5B+ Parameters
-
-Guidance:
-- Prefer BF16 on modern GPUs.
-- Use sliding‑window/block‑sparse attention with a window sized to your memory budget; add periodic global reach instead of going fully dense.
-- Add activation checkpointing if you need margin.
-- Group parameters into specialized optimizer sets to keep step times predictable and stable.
-- Increase sequence length and batch size gradually; monitor loss curvature and validation perplexity; adjust long/short block schedules before widening dense attention.
-
----
-
 ## Setup
 
 **Environment**
 - Conda environment file and requirements are provided. Use your preferred Conda workflow.
-- Python 3.12 is supported.
+- We use the Torch nightlies (currently 2.10) and CUDA 12.6
 
 **Quickstart**
 1. Prepare data shards for instruction fine‑tuning.
@@ -160,10 +156,9 @@ Guidance:
 
 **Example Commands**
 - Inspect training options:
-  - `python train_gpt_baseline.py --help`
-  - `python train_gpt_350MM.py --help`
+  - `python train_350b.py --help`
 - Start a training run:
-  - `python -u train_gpt_350MM.py`
+  - `python -u train_350b.py`
 - Generate samples after training:
   - `python sample.py`
 

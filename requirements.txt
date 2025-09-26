@@ -2,3 +2,4 @@ numpy
 tqdm
 torch # we use nighties, currently 2.10: pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade
 huggingface-hub
+tiktoken
