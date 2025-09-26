@@ -370,6 +370,7 @@ class Hyperparameters:
     val_tokens: int = 10485760  # how many tokens of validation data
     val_loss_every: int = 125    # num steps between validation loss calculations
     save_checkpoint: bool = True
+    init_checkpoint: str | None = None
 
 def load_hparams_from_yaml(config_path: str | None) -> Hyperparameters:
     """
@@ -402,7 +403,9 @@ def load_hparams_from_yaml(config_path: str | None) -> Hyperparameters:
     return Hyperparameters(**cfg_dict)
 
 args = load_hparams_from_yaml(sys.argv[1] if len(sys.argv) > 1 else None)
-
+for s in sys.argv[1:]:
+    if s.startswith('--init-checkpoint=') or s.startswith('--init_checkpoint='):
+        args.init_checkpoint = s.split('=',1)[1]
 
 
 
@@ -473,6 +476,15 @@ def _flex_call(q, k, v, block_mask, scale):
 
 model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, num_heads=8, model_dim=1024,
                        max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+
+if args.init_checkpoint:
+    _obj = torch.load(args.init_checkpoint, map_location=device)
+    _sd = _obj.get('model', _obj) if isinstance(_obj, dict) else _obj
+    if isinstance(_sd, dict) and any(k.startswith('_orig_mod.') for k in _sd.keys()):
+        _sd = {k.replace('_orig_mod.', '', 1): v for k, v in _sd.items()}
+    _missing, _unexpected = model.load_state_dict(_sd, strict=False)
+    print0(f"init_checkpoint:{args.init_checkpoint} missing:{len(_missing)} unexpected:{len(_unexpected)}", console=True)
+
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
@@ -554,6 +566,11 @@ del initial_state
 
 torch.cuda.reset_peak_memory_stats()
 train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
+tokens_per_step = world_size * args.train_seq_len
+tokens_seen = 0
+last_val_loss = None
+last_val_tokens = 0
+ema_dloss_per_token = None
 training_time_ms = 0
 # start the clock
 dist.barrier()
@@ -579,9 +596,20 @@ for step in range(train_steps + 1):
                 inputs, targets = next(val_loader)
                 val_loss += model(inputs, targets, get_window_size_blocks(step))
         val_loss /= val_steps
+        tokens_since_last = tokens_seen - last_val_tokens
+        if last_val_loss is not None and tokens_since_last > 0:
+            dpt = (val_loss.item() - last_val_loss) / tokens_since_last
+            ema_dloss_per_token = dpt if ema_dloss_per_token is None else 0.7 * ema_dloss_per_token + 0.3 * dpt
+            print0(
+                f"dloss_per_token:{dpt:.6e} dloss_per_1e9tok:{dpt * 1e9:.6f} ema_dloss_per_1e9tok:{(ema_dloss_per_token or 0.0) * 1e9:.6f}",
+                console=True)
+        last_val_loss = float(val_loss.item())
+        last_val_tokens = tokens_seen
+
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.6f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+
         model.train()
         # start the clock again
         dist.barrier()
@@ -615,6 +643,7 @@ for step in range(train_steps + 1):
         opt.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
+    tokens_seen += tokens_per_step
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
