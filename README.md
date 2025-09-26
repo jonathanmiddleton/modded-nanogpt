@@ -1,10 +1,10 @@
-# Scalable GPT Experiments (modded-nanogpt fork)
+# Daisy-Wee - Efficient GPT for Small‑B Models
 
-Tiny Daisy is a fork of the excellent modded-nanogpt:
-- https://github.com/KellerJordan/modded-nanogpt.git
+Daisy-Wee is a fork of the excellent [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt.git), itself a fork of the venerable [nanoGPT](https://github.com/karpathy/nanoGPT.git):
+
 
 Purpose:
-- Push the core GPT architecture to efficiently support 1.5B+ parameter models (and beyond) on commodity multi-GPU setups.
+- Evolve the core GPT architecture to *efficiently* support 1.5B+ parameter models (and beyond) on commodity multi-GPU setups.
 - Provide an instruction-following fine-tuning pipeline.
 - Explore an MoE (Mixture-of-Experts) variant designed for throughput and memory efficiency on small devices.
 
