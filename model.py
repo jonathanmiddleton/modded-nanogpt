@@ -11,11 +11,28 @@ class Hyperparameters:
     train_seq_len = 64*1024 # FlexAttention sequence length
     # architecture
     vocab_size = 50257
+    max_sliding_window_seq_len = 3456
+    block_size = 128
+    max_sliding_window_num_blocks = max_sliding_window_seq_len // block_size
+    bos_token_id = 50256
 
 args = Hyperparameters()
 
+def _num_blocks(length: int):
+    b = min((length + args.block_size - 1) // args.block_size, args.max_sliding_window_num_blocks)
+    return max(b, 1)
+
 def _flex_call(q, k, v, block_mask, scale):
     return flex_attention(q, k, v, block_mask=block_mask, scale=scale)
+
+def _crop_to_max_seq_len(idx: torch.Tensor, max_sequence_length: int):
+    return idx if idx.size(-1) <= args.max_sliding_window_seq_len else idx[:, -args.max_sliding_window_seq_len:]
+
+def _pad_mod_block_size(idx: torch.Tensor, block_size: int) -> tuple[torch.Tensor, int]:
+    pad_len = args.block_size - idx.size(-1) % args.block_size if idx.size(-1) != 0 else block_size
+    idx_padded = idx if idx.size(-1) % args.block_size == 0 else F.pad(idx, (0, pad_len), value=args.bos_token_id)
+    return idx_padded, pad_len
+
 
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
@@ -67,9 +84,17 @@ class CausalSelfAttention(nn.Module):
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         v = norm(v)
+
+        # ensure q, k, v, ve, and lambdas share the same dtype to avoid SDPA dtype mismatch
+        target_dtype = q.dtype
+        v = v.to(target_dtype)
+
         if ve is not None:
+            ve = ve.to(target_dtype)
+            lambdas = lambdas.to(target_dtype)
             v = lambdas[0] * v + lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
+            lambdas = lambdas.to(target_dtype)
             v = lambdas[0] * v
         y = _flex_call(
             q.transpose(1, 2),
@@ -118,9 +143,8 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, device='mps'):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
         super().__init__()
-        self.device = device
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
@@ -140,7 +164,7 @@ class GPT(nn.Module):
 
     #@disable
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
-        BLOCK_SIZE = 128
+        BLOCK_SIZE = args.block_size
         docs = (input_seq == 50256).cumsum(0)
 
         def document_causal(b, h, q_idx, kv_idx):
@@ -156,7 +180,7 @@ class GPT(nn.Module):
         # manual block mask creation by @YouJiacheng
         assert len(input_seq) % BLOCK_SIZE == 0
         NUM_BLOCKS = len(input_seq) // BLOCK_SIZE
-        block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device=self.device)
+        block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device=input_seq.device)
         causal_blockmask_any = block_idx[:, None] >= block_idx
         causal_blockmask_all = block_idx[:, None] > block_idx
         docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
@@ -220,29 +244,75 @@ class GPT(nn.Module):
             loss += F.cross_entropy(15 * logits * torch.rsqrt(logits.square() + 225), target_seq.chunk(4)[i]) / 4
         return loss
 
-    @torch.no_grad()
+    @torch.inference_mode()
+    def forward_inference(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
+        assert input_seq.ndim == 1
+
+        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
+        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
+        ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
+        assert len(ve) == len(self.blocks)
+
+        long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
+        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, short_bm, short_bm,
+                       short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+        assert len(block_masks) == len(self.blocks)
+
+        x = x0 = norm(self.embed(input_seq)[None])  # use of norm here by @Grad62304977
+
+        skip_connections = []
+        skip_map = {
+            9: 6,
+            10: 4,
+            11: 2,
+        }
+        skip_weights = self.scalars[:len(self.blocks)]
+        lambdas = self.scalars[1 * len(self.blocks): 3 * len(self.blocks)].view(-1, 2)
+        sa_lambdas = self.scalars[3 * len(self.blocks): 5 * len(self.blocks)].view(-1, 2)
+        for i in range(len(self.blocks)):
+            if i in skip_map:
+                x = x + skip_weights[skip_map[i]] * skip_connections[skip_map[i]]
+            x = self.blocks[i](x, ve[i], x0, block_masks[i], lambdas[i], sa_lambdas[i])
+            skip_connections.append(x)
+
+        x = norm(x)
+        logits = F.linear(x.flatten(end_dim=1), self.lm_head_w.bfloat16()).float()
+
+        return logits.view(x.size(0), x.size(1), -1)
+
+
+    @torch.inference_mode()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        Take a conditioning sequence of indices idx (LongTensor of shape (B,T)) B=1 and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        if idx.ndim != 2:
+            raise AssertionError(f"idx must be 2D (B,T), got ndim={idx.ndim}")
+        if idx.size(0) != 1:
+            raise AssertionError(f"idx batch size must be 1, got idx.size(0)={idx.size(0)}")
+
+        device = idx.device
+
+        sliding_window_num_blocks = torch.empty((), dtype=torch.int32, device=device)
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
+            # format for block masking
+            idx_padded, _ = _pad_mod_block_size(_crop_to_max_seq_len(idx, args.block_size), args.block_size)
+            num_blocks = min(_num_blocks(idx_padded.size(-1)), args.max_sliding_window_num_blocks)
+            # calculate covering blocks for sliding window attention
+            sliding_window_num_blocks.fill_(num_blocks)
+
+            logits = self.forward_inference(idx_padded.squeeze(0), sliding_window_num_blocks)
+            t_last = idx.size(1)-1
+            logits = logits[:, t_last, :args.vocab_size] / temperature
+
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
+
             probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
