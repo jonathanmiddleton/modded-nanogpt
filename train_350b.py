@@ -6,9 +6,11 @@ with open(sys.argv[0]) as f:
 import uuid
 import time
 import copy
-from dataclasses import dataclass
+import dataclasses
+from dataclasses import dataclass, fields as dataclass_fields
 from functools import lru_cache
 from pathlib import Path
+import yaml
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -356,30 +358,50 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
 
 @dataclass
 class Hyperparameters:
-    ## pre-train
-    # train_files = "data/fineweb100B/fineweb_train_*.bin" # input .bin to train on
-    # val_files = "data/fineweb100B/fineweb_val_*.bin" # input .bin to eval validation loss on
-    # train_seq_len = 64*1024 # FlexAttention sequence length
-    # val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
-    # num_iterations = 5960 # number of iterations to run
-    # cooldown_frac = 0.7  # fraction of training spent cooling down the learning rate
+    # Required scenario-specific fields
+    train_files: str
+    val_files: str
+    train_seq_len: int
+    val_seq_len: int
+    num_iterations: int
+    cooldown_frac: float
+    # Common fields with defaults
+    vocab_size: int = 50257
+    val_tokens: int = 10485760  # how many tokens of validation data
+    val_loss_every: int = 125    # num steps between validation loss calculations
+    save_checkpoint: bool = True
 
-    ## fine-tune
-    train_files = "data/instruct_mix/instruct_train_*.bin"
-    val_files = "data/instruct_mix/instruct_val_*.bin"
-    train_seq_len = 2048
-    val_seq_len = 8192
-    num_iterations = 3000
-    cooldown_frac = 0.9
-    val_loss_every = 250
+def load_hparams_from_yaml(config_path: str | None) -> Hyperparameters:
+    """
+    Load Hyperparameters from a YAML file. If no path is provided, defaults to config/instruct_sft.yml.
+    Validates keys and required fields against the Hyperparameters dataclass.
+    """
+    cfg_dict = {}
+    used_path: Path | None = None
+    if config_path:
+        used_path = Path(config_path)
+        with open(used_path, "r") as f:
+            cfg_dict = yaml.safe_load(f) or {}
+    else:
+        used_path = Path("config/instruct_sft.yml")
+        if used_path.exists():
+            with open(used_path, "r") as f:
+                cfg_dict = yaml.safe_load(f) or {}
 
-    ##
-    vocab_size = 50257
-    ##
-    val_tokens = 10485760  # how many tokens of validation data
-    val_loss_every = 125 # num steps between validation loss calculations
-    save_checkpoint = True
-args = Hyperparameters()
+    valid_names = {f.name for f in dataclass_fields(Hyperparameters)}
+    unknown = set(cfg_dict) - valid_names
+    if unknown:
+        raise ValueError(f"Unknown hyperparameter(s) in {used_path}: {sorted(unknown)}")
+
+    required = [f.name for f in dataclass_fields(Hyperparameters)
+                if f.default is dataclasses.MISSING and getattr(f, "default_factory", dataclasses.MISSING) is dataclasses.MISSING]
+    missing = [name for name in required if name not in cfg_dict]
+    if missing:
+        raise ValueError(f"Missing required hyperparameter(s) in {used_path}: {missing}")
+
+    return Hyperparameters(**cfg_dict)
+
+args = load_hparams_from_yaml(sys.argv[1] if len(sys.argv) > 1 else None)
 
 
 

@@ -148,21 +148,25 @@ MoE will be introduced incrementally and benchmarked against the dense baseline 
 **Environment**
 - Conda environment file and requirements are provided. Use your preferred Conda workflow.
 - We use the Torch nightlies (currently 2.10) and CUDA 12.6
+- Training requires your CUDA device of choice. run.sh assumes 8x H100 but 1x H100 is fine.
 
 **Quickstart**
-1. Prepare data shards for instruction fine‑tuning.
+1. Download pretraining data. (data/cached_fineweb100B.py - you need only the first 103 files for 10B, edit the script to download more)
 2. Launch training for the 350M baseline.
-3. Periodically run validation and sampling to monitor quality.
+3. Prepare data shards for instruction fine‑tuning. 
+4. Launch SFT.
 
 **Example Commands**
 - Inspect training options:
   - `python train_350b.py --help`
-- Start a training run:
-  - `python -u train_350b.py`
+- Start a pretraining run:
+  - `python -u train_350b.py config/pretrain.yml`
 - Generate samples after training:
   - `python sample.py`
-
-_Script names/flags may evolve; `--help` is authoritative._
+- Build SFT data shards:
+  - `python build_sft_shards.py`
+- Start an SFT run:
+  - `python -u train_350b.py config/instruct_sft.yml`
 
 ---
 
