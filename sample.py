@@ -3,7 +3,7 @@ import sys
 import torch
 from torch import nn, load, tensor
 import tiktoken
-from model import GPT, Hyperparameters as args
+from model import GPT, Hyperparameters as args, generate
 
 # Command line interface
 parser = argparse.ArgumentParser(description="Generate text with a GPT model from a checkpoint.")
@@ -29,7 +29,7 @@ cli = parser.parse_args()
 device = cli.device
 checkpoint = load(cli.checkpoint, map_location=device)
 model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, num_heads=8, model_dim=1024,
-                       max_seq_len=args.train_seq_len)
+                       max_seq_len=args.train_seq_len).to(device)
 state_dict = checkpoint['model']
 
 unwanted_prefix = '_orig_mod.'
@@ -41,7 +41,7 @@ model.load_state_dict(state_dict)
 model.eval()
 if device != 'cpu':
     model.to(device)
-    model = torch.compile(model)
+    model = torch.compile(model, dynamic=True)
 enc = tiktoken.get_encoding("gpt2")
 encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
 decode = lambda l: enc.decode(l)
@@ -63,5 +63,5 @@ devtype = "cuda" if str(device).startswith("cuda") else ("mps" if str(device).st
 ctx = torch.amp.autocast(device_type=devtype, dtype=torch.bfloat16)
 with torch.no_grad():
     with ctx:
-        y = model.generate(x, max_new_tokens=cli.max_tokens, temperature=cli.temperature, top_k=cli.top_k, repetition_penalty=cli.repetition_penalty)
+        y = generate(model, x, max_new_tokens=cli.max_tokens, temperature=cli.temperature, top_k=cli.top_k, repetition_penalty=cli.repetition_penalty)
         print(decode(y[0].tolist()))

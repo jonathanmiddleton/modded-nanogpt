@@ -143,17 +143,16 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 
-def apply_rep_penalty_decay(logits, prev_ids, rep_p, W=128, half_life=140.0, cap=3.0):
-    prev = prev_ids[-W:]
+def apply_rep_penalty_decay(logits, prev_ids, rep_p, rep_w=128, rep_h=140.0, cap=3.0):
+    prev = prev_ids[-rep_w:]
     if prev.numel() == 0:
         return logits
     V = logits.size(-1)
     d = torch.arange(prev.numel(), 0, -1, device=logits.device, dtype=logits.dtype)
-    w = (0.5 ** (d / half_life))
+    w = (0.5 ** (d / rep_h))
     s = torch.bincount(prev, weights=w, minlength=V).to(logits.dtype).clamp_max_(cap)
     scale = rep_p ** s
     return torch.where(logits > 0, logits / scale, logits * scale)
-
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
@@ -216,7 +215,8 @@ class GPT(nn.Module):
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
-    def forward(self, input_seq: Tensor, sliding_window_num_blocks: Tensor, target_seq: Tensor = None):
+
+    def forward(self, input_seq: Tensor, sliding_window_num_blocks: Tensor, target_seq: Tensor = None, inference: bool = False):
         assert input_seq.ndim == 1
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
@@ -251,89 +251,64 @@ class GPT(nn.Module):
             loss = F.cross_entropy(15 * logits * torch.rsqrt(logits.square() + 225), target_seq)
             return loss
 
-        loss = 0
-        for i in range(4):
-            logits: Tensor = F.linear(x.flatten(end_dim=1).chunk(4)[i], self.lm_head_w.bfloat16()).float()
-            loss += F.cross_entropy(15 * logits * torch.rsqrt(logits.square() + 225), target_seq.chunk(4)[i]) / 4
-        return loss
+        if not inference:
+            loss = 0
+            for i in range(4):
+                logits: Tensor = F.linear(x.flatten(end_dim=1).chunk(4)[i], self.lm_head_w.bfloat16()).float()
+                loss += F.cross_entropy(15 * logits * torch.rsqrt(logits.square() + 225), target_seq.chunk(4)[i]) / 4
+            return loss
+        else:
+            logits: Tensor = F.linear(x.flatten(end_dim=1), self.lm_head_w.bfloat16()).float()
+            return logits.view(x.size(0), x.size(1), -1)
 
-    @torch.inference_mode()
-    def forward_inference(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
-        assert input_seq.ndim == 1
 
-        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
-        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
-        assert len(ve) == len(self.blocks)
+@torch.inference_mode()
+def generate(model, idx, max_new_tokens, temperature=1.0, repetition_penalty=1.0, rep_w=128, rep_h=128.0, top_k=None):
+    """
+    Take a conditioning sequence of indices idx (LongTensor of shape (B,T)) B=1 and complete
+    the sequence max_new_tokens times, feeding the predictions back into the model each time.
+    Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+    """
+    if idx.ndim != 2:
+        raise AssertionError(f"idx must be 2D (B,T), got ndim={idx.ndim}")
+    if idx.size(0) != 1:
+        raise AssertionError(f"idx batch size must be 1, got idx.size(0)={idx.size(0)}")
 
-        long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
-        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, short_bm, short_bm,
-                       short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
-        assert len(block_masks) == len(self.blocks)
+    device = idx.device
 
-        x = x0 = norm(self.embed(input_seq)[None])  # use of norm here by @Grad62304977
+    sliding_window_num_blocks = torch.empty((), dtype=torch.int32, device=device)
+    prev_ids = torch.empty(0, dtype=torch.int32, device=device)
+    W = 192 # repetition window size
+    for _ in range(max_new_tokens):
+        # format for block masking
+        idx_padded, _ = _pad_mod_block_size(_crop_to_max_seq_len(idx, args.block_size), args.block_size)
+        num_blocks = min(_num_blocks(idx_padded.size(-1)), args.max_sliding_window_num_blocks)
+        # calculate covering blocks for sliding window attention
+        sliding_window_num_blocks.fill_(num_blocks)
 
-        skip_connections = []
-        skip_map = {
-            9: 6,
-            10: 4,
-            11: 2,
-        }
-        skip_weights = self.scalars[:len(self.blocks)]
-        lambdas = self.scalars[1 * len(self.blocks): 3 * len(self.blocks)].view(-1, 2)
-        sa_lambdas = self.scalars[3 * len(self.blocks): 5 * len(self.blocks)].view(-1, 2)
-        for i in range(len(self.blocks)):
-            if i in skip_map:
-                x = x + skip_weights[skip_map[i]] * skip_connections[skip_map[i]]
-            x = self.blocks[i](x, ve[i], x0, block_masks[i], lambdas[i], sa_lambdas[i])
-            skip_connections.append(x)
+        logits = model(idx_padded.squeeze(0), sliding_window_num_blocks, inference=True)
+        t_last = idx.size(-1)-1
+        logits = logits[:, t_last, :args.vocab_size]
+        if temperature != 0.0:
+            logits = logits / temperature
 
-        x = norm(x)
-        logits = F.linear(x.flatten(end_dim=1), self.lm_head_w.bfloat16()).float()
+        logits = apply_rep_penalty_decay(logits, prev_ids, rep_p=repetition_penalty, rep_w=rep_w, rep_h=rep_h)
 
-        return logits.view(x.size(0), x.size(1), -1)
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = -float('Inf')
 
-    @torch.inference_mode()
-    def generate(self, idx, max_new_tokens, temperature=1.0, repetition_penalty=1.0, top_k=None):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (B,T)) B=1 and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
-        if idx.ndim != 2:
-            raise AssertionError(f"idx must be 2D (B,T), got ndim={idx.ndim}")
-        if idx.size(0) != 1:
-            raise AssertionError(f"idx batch size must be 1, got idx.size(0)={idx.size(0)}")
+        probs = F.softmax(logits, dim=-1)
 
-        device = idx.device
-
-        sliding_window_num_blocks = torch.empty((), dtype=torch.int32, device=device)
-        prev_ids = torch.empty(0, dtype=torch.int32, device=device)
-        W = 192 # repetition window size
-        for _ in range(max_new_tokens):
-            # format for block masking
-            idx_padded, _ = _pad_mod_block_size(_crop_to_max_seq_len(idx, args.block_size), args.block_size)
-            num_blocks = min(_num_blocks(idx_padded.size(-1)), args.max_sliding_window_num_blocks)
-            # calculate covering blocks for sliding window attention
-            sliding_window_num_blocks.fill_(num_blocks)
-
-            logits = self.forward_inference(idx_padded.squeeze(0), sliding_window_num_blocks)
-            t_last = idx.size(1)-1
-            logits = logits[:, t_last, :args.vocab_size] / temperature
-
-            logits = apply_rep_penalty_decay(logits, prev_ids, rep_p=repetition_penalty, W=W)
-
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-
-            probs = F.softmax(logits, dim=-1)
+        if temperature == 0.0:
+            idx_next = torch.argmax(probs, dim=-1, keepdim=True)
+        else:
             idx_next = torch.multinomial(probs, num_samples=1)
 
-            idx = torch.cat((idx, idx_next), dim=1)
-            if idx_next.item() == 50256:
-                break
+        idx = torch.cat((idx, idx_next), dim=1)
+        if idx_next.item() == 50256:
+            break
 
-            prev_ids = torch.cat((prev_ids, idx_next.squeeze(0)), dim=0)
+        prev_ids = torch.cat((prev_ids, idx_next.squeeze(0)), dim=0)
 
-        return idx
+    return idx

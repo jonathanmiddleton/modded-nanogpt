@@ -3,7 +3,6 @@ import sys
 
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
-import uuid
 import time
 import copy
 import dataclasses
@@ -424,7 +423,7 @@ master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
 # begin logging
 if master_process:
-    run_id_full = f"{run_id:03d}_{uuid.uuid4()}"
+    run_id_full = f"{int(time.time())}_{run_id:03d}"
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id_full}.txt"
     print(logfile)
@@ -600,9 +599,9 @@ for step in range(train_steps + 1):
 
     if last_step:
         if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-            os.makedirs(f"logs/{run_id_full}", exist_ok=True)
-            torch.save(log, f"logs/{run_id_full}/state_step{step:06d}.pt")
+            log = dict(step=step, code=code, model=model._orig_mod.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            os.makedirs(f"checkpoints", exist_ok=True)
+            torch.save(log, f"checkpoints/{run_id_full}.pt")
         # the last step only has the validation loop, so break to avoid training
         break
 
